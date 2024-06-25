@@ -5,6 +5,7 @@ const promClient = require('prom-client');
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
+const winston = require('winston');
 
 // Load environment variables from .env file
 dotenv.config();
@@ -23,7 +24,7 @@ app.use(express.json());
 const client = new MongoClient(mongoUrl, { useNewUrlParser: true, useUnifiedTopology: true });
 
 // Initialize Discord bot
-const discordBot = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const discordBot = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildPresences] });
 discordBot.commands = new Collection();
 
 // Load command files
@@ -47,6 +48,7 @@ async function startServer() {
         const cachedPresences = db.collection('cached_presences');
         const globalSubscribers = db.collection('global_subscribers');
         const analytics = db.collection('analytics');
+        const presenceNotifications = db.collection('presence_notifications');
 
         // CRUD routes for cached_presences
         app.get('/cached_presences', async (req, res) => {
@@ -140,8 +142,32 @@ async function startServer() {
             try {
                 await command.execute(message, args, db);
             } catch (error) {
-                console.error(error);
+                console.error(`Error executing command: ${error}`);
                 message.reply('There was an error executing that command!');
+            }
+        });
+
+        discordBot.on('presenceUpdate', async (oldPresence, newPresence) => {
+            try {
+                if (!newPresence) return;
+
+                const { userId, status } = newPresence;
+                const presenceData = {
+                    userId: userId,
+                    status: status,
+                    timestamp: new Date()
+                };
+                await cachedPresences.insertOne(presenceData);
+
+                // Notify users who are monitoring this user's presence
+                const notifications = await presenceNotifications.find({ targetUserId: userId }).toArray();
+
+                for (const notification of notifications) {
+                    const notifyUser = await discordBot.users.fetch(notification.notifyUserId);
+                    notifyUser.send(`<@${userId}> changed their presence to ${status}`);
+                }
+            } catch (error) {
+                console.error(`Error handling presence update: ${error}`);
             }
         });
 
