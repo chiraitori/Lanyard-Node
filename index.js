@@ -1,11 +1,10 @@
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
-const { Client, GatewayIntentBits, Collection } = require('discord.js');
+const { Client, GatewayIntentBits, Collection, Events } = require('discord.js');
 const promClient = require('prom-client');
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
-const winston = require('winston');
 
 // Load environment variables from .env file
 dotenv.config();
@@ -119,13 +118,31 @@ async function startServer() {
             res.json(result);
         });
 
+        // Route to get presence data for a specific user
+        app.get('/presence/:id', async (req, res) => {
+            const { id } = req.params;
+
+            try {
+                const presenceData = await cachedPresences.findOne({ userId: id });
+
+                if (!presenceData) {
+                    return res.status(404).json({ success: false, message: 'User not found' });
+                }
+
+                res.json({ success: true, data: presenceData });
+            } catch (error) {
+                console.error(`Error fetching presence data: ${error}`);
+                res.status(500).json({ success: false, message: 'Internal Server Error' });
+            }
+        });
+
         // Start the Express server
         app.listen(port, () => {
             console.log(`Server is running on port ${port}`);
         });
 
         // Discord bot event handlers
-        discordBot.on('ready', () => {
+        discordBot.once('ready', () => {
             console.log(`Logged in as ${discordBot.user.tag}!`);
         });
 
@@ -140,10 +157,25 @@ async function startServer() {
             if (!command) return;
 
             try {
-                await command.execute(message, args, db);
+                await command.executePrefix(message, args);
             } catch (error) {
                 console.error(`Error executing command: ${error}`);
                 message.reply('There was an error executing that command!');
+            }
+        });
+
+        discordBot.on(Events.InteractionCreate, async interaction => {
+            if (!interaction.isCommand()) return;
+
+            const command = discordBot.commands.get(interaction.commandName);
+
+            if (!command) return;
+
+            try {
+                await command.execute(interaction);
+            } catch (error) {
+                console.error(`Error executing slash command: ${error}`);
+                await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true });
             }
         });
 
@@ -152,23 +184,48 @@ async function startServer() {
                 if (!newPresence) return;
 
                 const { userId, status } = newPresence;
+                const activities = newPresence.activities.map(activity => ({
+                    id: activity.id,
+                    name: activity.name,
+                    type: activity.type,
+                    state: activity.state,
+                    details: activity.details,
+                    timestamps: activity.timestamps,
+                    assets: activity.assets,
+                    party: activity.party,
+                    createdAt: activity.createdTimestamp,
+                }));
+
                 const presenceData = {
                     userId: userId,
+                    username: newPresence.user.username,
+                    avatar: newPresence.user.avatar,
+                    discriminator: newPresence.user.discriminator,
+                    globalName: newPresence.user.globalName,
+                    displayName: newPresence.user.displayName,
+                    publicFlags: newPresence.user.publicFlags,
+                    activities: activities,
                     status: status,
-                    timestamp: new Date()
+                    activeOnDiscordWeb: newPresence.clientStatus?.web || false,
+                    activeOnDiscordDesktop: newPresence.clientStatus?.desktop || false,
+                    activeOnDiscordMobile: newPresence.clientStatus?.mobile || false,
+                    listeningToSpotify: activities.some(activity => activity.name === 'Spotify'),
                 };
-                await cachedPresences.insertOne(presenceData);
 
-                // Notify users who are monitoring this user's presence
-                const notifications = await presenceNotifications.find({ targetUserId: userId }).toArray();
+                await cachedPresences.updateOne(
+                    { userId: userId },
+                    { $set: presenceData },
+                    { upsert: true }
+                );
 
-                for (const notification of notifications) {
-                    const notifyUser = await discordBot.users.fetch(notification.notifyUserId);
-                    notifyUser.send(`<@${userId}> changed their presence to ${status}`);
-                }
             } catch (error) {
                 console.error(`Error handling presence update: ${error}`);
             }
+        });
+
+        // Improved error handling for Discord bot
+        process.on('unhandledRejection', error => {
+            console.error('Unhandled promise rejection:', error);
         });
 
         // Log in to Discord
